@@ -357,6 +357,21 @@ class SeiClient:
         resp_arv = await self.http_client.get(url_arvore_src, headers={"Referer": str(resp.url)})
         resp_arv.raise_for_status()
 
+        # Processos grandes têm a árvore paginada em "Pastas" (Pasta I, Pasta II, ...).
+        # Por padrão só a última pasta vem carregada na resposta acima (demais nós ficam
+        # como "AGUARDE" placeholder, carregado=false). Segue o link "Abrir todas as Pastas"
+        # (ação ABRIR_PASTAS, sempre presente na árvore) para forçar a expansão de todas elas
+        # antes de parsear — sem isso, documentos das pastas mais antigas somem da consulta.
+        m_abrir = re.search(
+            r'"ABRIR_PASTAS".*?"(controlador\.php\?acao=procedimento_visualizar[^"]+abrir_pastas=1[^"]+)"',
+            resp_arv.text,
+        )
+        if m_abrir:
+            url_abrir_pastas = urljoin(str(resp_arv.url), m_abrir.group(1))
+            resp_abrir = await self.http_client.get(url_abrir_pastas, headers={"Referer": str(resp_arv.url)})
+            if resp_abrir.status_code == 200 and "acao=login" not in str(resp_abrir.url):
+                resp_arv = resp_abrir
+
         dados_arvore = parse_arvore_processo(resp_arv.text)
         dados_arvore["id_procedimento"] = _extrair_id_procedimento(url_arvore_src)
         if not dados_arvore.get("numero_processo"):
