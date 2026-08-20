@@ -25,7 +25,7 @@ class SeiSettings(BaseSettings):
     base_url: str = Field(
         default="",
         alias="SEI_BASE_URL",
-        description="URL base do SEI (ex: https://sei.cbm.df.gov.br/sei)",
+        description="URL base do SEI (ex: https://sei.cbm.df.gov.br/sei ou https://sei.go.gov.br/sei)",
     )
     usuario: str = Field(
         default="",

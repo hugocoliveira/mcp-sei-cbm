@@ -95,14 +95,14 @@ async def sei_listar_controle_processos() -> str:
 
 @mcp.tool(
     name="sei_consultar_processo",
-    description="Consulta os detalhes, metadados e a árvore de documentos de um processo pelo seu número formatado (ex: 00000.000000/2026-00) ou ID."
+    description="Consulta os detalhes, metadados e a árvore de documentos de um processo pelo seu número (ex: 202600011025521 ou 00053.000123/2026-10) ou ID interno."
 )
 async def sei_consultar_processo(numero_ou_id: str) -> str:
     """
     Busca um processo específico no SEI e retorna seus documentos e interessados.
     
     Args:
-        numero_ou_id: Número do processo (ex: 00000.000000/2026-00) ou ID de procedimento.
+        numero_ou_id: Número do processo (ex: 202600011025521) ou ID de procedimento.
     """
     try:
         processo = await sei_client.consultar_processo(numero_ou_id)
@@ -150,14 +150,14 @@ async def sei_ler_documento(id_documento: str, id_procedimento: Optional[str] = 
 
 @mcp.tool(
     name="sei_pesquisar",
-    description="Pesquisa processos ou documentos no SEI por palavras-chave, número ou interessado."
+    description="Pesquisa processos ou documentos no SEI por palavras-chave, número de protocolo ou interessado."
 )
 async def sei_pesquisar(termo: str) -> str:
     """
     Realiza busca no acervo do SEI.
     
     Args:
-        termo: Termo ou número a ser pesquisado.
+        termo: Termo ou número a ser pesquisado (ex: 202600011025521 ou CBM).
     """
     try:
         resultados = await sei_client.pesquisar(termo)
@@ -201,6 +201,24 @@ async def sei_adicionar_andamento(id_procedimento: str, descricao: str) -> str:
         return json.dumps(resultado, indent=2, ensure_ascii=False)
     except Exception as e:
         return f"Erro ao registrar andamento no processo '{id_procedimento}': {str(e)}"
+
+
+@mcp.tool(
+    name="sei_diagnostico",
+    description="Executa um diagnóstico detalhado dos endpoints do SEI e testa uma pesquisa de referência."
+)
+async def sei_diagnostico(termo_teste: str = "202600011025521") -> str:
+    """
+    Executa diagnóstico técnico da conexão e das rotas de consulta do SEI.
+    
+    Args:
+        termo_teste: Número ou termo para teste de consulta.
+    """
+    try:
+        resultado = await sei_client.diagnosticar(termo_teste)
+        return json.dumps(resultado, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"Erro ao executar diagnóstico do SEI: {str(e)}"
 
 
 def main():

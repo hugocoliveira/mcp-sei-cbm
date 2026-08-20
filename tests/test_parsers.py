@@ -70,14 +70,14 @@ def test_parse_controle_processos():
       <body>
         <table id="tblProcessosRecebidos" class="infraTable">
           <tr>
-            <td><a href="controlador.php?acao=procedimento_trabalhar&id_procedimento=1234567">00053.000123/2026-10</a></td>
+            <td><a href="controlador.php?acao=procedimento_trabalhar&id_procedimento=1234567">202600011025521</a></td>
             <td>Ofício</td>
             <td>chagas.silva</td>
           </tr>
         </table>
         <table id="tblProcessosGerados" class="infraTable">
           <tr>
-            <td><a href="controlador.php?acao=procedimento_trabalhar&id_procedimento=7654321">00053.000456/2026-20</a></td>
+            <td><a href="#" onclick="infraAbreJanela('controlador.php?acao=procedimento_trabalhar&id_procedimento=7654321')">202300011005879</a></td>
             <td>Aquisição</td>
             <td>admin</td>
           </tr>
@@ -87,32 +87,36 @@ def test_parse_controle_processos():
     """
     res = parse_controle_processos(html)
     assert len(res["processos_recebidos"]) == 1
-    assert res["processos_recebidos"][0]["numero"] == "00053.000123/2026-10"
+    assert res["processos_recebidos"][0]["numero"] == "202600011025521"
     assert res["processos_recebidos"][0]["id_procedimento"] == "1234567"
 
     assert len(res["processos_gerados"]) == 1
-    assert res["processos_gerados"][0]["numero"] == "00053.000456/2026-20"
+    assert res["processos_gerados"][0]["numero"] == "202300011005879"
     assert res["processos_gerados"][0]["id_procedimento"] == "7654321"
 
 
-def test_parse_arvore_processo():
+def test_parse_arvore_processo_js():
     html = """
     <html>
+      <head>
+        <script type="text/javascript">
+          Nos[0] = new infraArvoreNo('P99999', null, 'Processo 202600011025521', 'controlador.php?acao=procedimento_dados&id_procedimento=99999');
+          Nos[1] = new infraArvoreNo('D11111', 'P99999', 'Despacho 123 (11111)', 'controlador.php?acao=documento_visualizar&id_documento=11111&id_procedimento=99999');
+          Nos[2] = new infraArvoreNo('D22222', 'P99999', 'Termo de Referencia (22222)', 'controlador.php?acao=documento_visualizar&id_documento=22222&id_procedimento=99999');
+        </script>
+      </head>
       <body>
         <div><span>Tipo do Processo: Aquisição de Equipamentos</span></div>
         <div><span>Interessado: CBMDF</span></div>
-        <div id="divArvore">
-          <a href="controlador.php?acao=documento_visualizar&id_documento=11111&id_procedimento=99999">Despacho 123 (11111)</a>
-          <a href="controlador.php?acao=documento_visualizar&id_documento=22222&id_procedimento=99999">Termo de Referência (22222)</a>
-        </div>
       </body>
     </html>
     """
     res = parse_arvore_processo(html)
+    assert "202600011025521" in res["numero_processo"]
     assert res["tipo_processo"] == "Aquisição de Equipamentos"
     assert len(res["documentos"]) == 2
     assert res["documentos"][0]["id_documento"] == "11111"
-    assert "Despacho" in res["documentos"][0]["nome"]
+    assert res["documentos"][0]["nome"] == "Despacho 123 (11111)"
 
 
 def test_parse_conteudo_documento():
@@ -144,7 +148,7 @@ def test_parse_pesquisa_processos():
       <body>
         <table id="tblPesquisa" class="infraTable">
           <tr>
-            <td><a href="controlador.php?acao=procedimento_trabalhar&id_procedimento=55555">00053.999888/2026-99</a></td>
+            <td><a href="controlador.php?acao=procedimento_trabalhar&id_procedimento=55555">202600011025521</a></td>
             <td>Processo de Contratação Emergencial</td>
           </tr>
         </table>
@@ -153,5 +157,5 @@ def test_parse_pesquisa_processos():
     """
     res = parse_pesquisa_processos(html)
     assert len(res) == 1
-    assert res[0]["numero"] == "00053.999888/2026-99"
+    assert res[0]["numero"] == "202600011025521"
     assert res[0]["id"] == "55555"
