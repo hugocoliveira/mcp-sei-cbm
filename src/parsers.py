@@ -1,7 +1,7 @@
 """
 Módulo de Parsers HTML para o SEI (Sistema Eletrônico de Informações)
 Extrai informações estruturadas das páginas HTML, tabelas, árvores e scripts do SEI.
-Compatível com SEI 3.x, 4.x e customizações estaduais/federais.
+Compatível com SEI 3.x, 4.x e customizações estaduais (ex: SEI-GO / CBMGO).
 """
 
 import html as html_lib
@@ -92,6 +92,8 @@ def parse_login_error(html: str) -> Optional[str]:
         "Usuário desativado",
         "Senha expirada",
         "Código de segurança inválido",
+        "Link sem assinatura",
+        "Hash inválido",
     ]:
         if erro_padrao.lower() in texto_puro.lower():
             return erro_padrao
@@ -137,12 +139,12 @@ def parse_session_info(html: str) -> Dict[str, Any]:
 
 
 def _extrair_id_procedimento(texto_ou_url: str) -> Optional[str]:
-    """Extrai o id_procedimento de uma string, link href ou chamada onclick."""
+    """Extrai o id_procedimento ou id_protocolo de uma string, link href ou chamada onclick."""
     if not texto_ou_url:
         return None
-    m = re.search(r"id_procedimento=(\d+)", texto_ou_url)
+    m = re.search(r"id_procedimento=(\d+)|id_protocolo=(\d+)", texto_ou_url)
     if m:
-        return m.group(1)
+        return m.group(1) or m.group(2)
     m = re.search(r"trabalharProcedimento\(['\"]?(\d+)['\"]?", texto_ou_url)
     if m:
         return m.group(1)
@@ -155,7 +157,7 @@ def _extrair_id_procedimento(texto_ou_url: str) -> Optional[str]:
 def parse_controle_processos(html: str) -> Dict[str, List[Dict[str, Any]]]:
     """
     Analisa a tela principal do SEI (Controle de Processos)
-    e extrai os processos gerados e recebidos da unidade com suporte a múltiplos formatos de DOM.
+    e extrai os processos gerados e recebidos da unidade.
     """
     soup = BeautifulSoup(html, "html.parser")
     resultado = {
@@ -169,16 +171,17 @@ def parse_controle_processos(html: str) -> Dict[str, List[Dict[str, Any]]]:
             return processos
 
         for tr in tabela.find_all("tr"):
-            # Procura por link ou elemento com id_procedimento ou padrão de processo
-            link = tr.find("a", href=re.compile(r"procedimento_trabalhar|id_procedimento=", re.I))
-            if not link:
-                link = tr.find("a", onclick=re.compile(r"procedimento_trabalhar|id_procedimento=|trabalharProcedimento", re.I))
-            
-            # Se não encontrou link com ação, procura link com formato de número de protocolo
-            if not link:
-                for a in tr.find_all("a"):
-                    txt_a = clean_html_entities(a.get_text())
-                    if re.search(r"\d{4,}", txt_a):
+            link = None
+            # Procura link com número de processo
+            for a in tr.find_all("a"):
+                txt = clean_html_entities(a.get_text())
+                href = a.get("href", "")
+                onclick = a.get("onclick", "")
+                if re.search(r"\b\d{11,17}\b|\b\d{4,}\.\d{4,}\b|\b\d+/\d{4}\b", txt):
+                    link = a
+                    break
+                elif "procedimento_trabalhar" in href or "procedimento_trabalhar" in onclick:
+                    if txt:
                         link = a
                         break
 
@@ -190,26 +193,23 @@ def parse_controle_processos(html: str) -> Dict[str, List[Dict[str, Any]]]:
             onclick = link.get("onclick", "")
 
             id_proc = _extrair_id_procedimento(href) or _extrair_id_procedimento(onclick)
-            
-            # Se ainda não encontrou id_proc, procura nos checkboxes da linha
             if not id_proc:
                 chk = tr.find("input", type="checkbox")
                 if chk and chk.get("value", "").isdigit():
                     id_proc = chk.get("value")
 
             # Colunas adicionais
-            tds = tr.find_all("td")
             usuario_atribuido = ""
             anotacoes = []
-
-            for td in tds:
+            for td in tr.find_all("td"):
                 txt = clean_html_entities(td.get_text())
                 title = td.get("title", "")
                 if title:
                     anotacoes.append(title)
-                if "@" in txt or (len(txt) < 35 and "/" not in txt and txt != numero_proc and len(txt) > 2):
-                    if not usuario_atribuido:
-                        usuario_atribuido = txt
+                # No SEI-GO, usuário atribuído aparece como link com matrícula / login
+                for a_td in td.find_all("a"):
+                    if "usuario_atribuicao" in a_td.get("href", ""):
+                        usuario_atribuido = clean_html_entities(a_td.get_text())
 
             processos.append({
                 "numero": numero_proc,
@@ -222,46 +222,11 @@ def parse_controle_processos(html: str) -> Dict[str, List[Dict[str, Any]]]:
 
         return processos
 
-    # Tabelas por ID padrão
     tbl_gerados = soup.find("table", id=re.compile(r"tblProcessosGerados|tblGerados", re.I))
     tbl_recebidos = soup.find("table", id=re.compile(r"tblProcessosRecebidos|tblRecebidos", re.I))
 
-    if not tbl_gerados and not tbl_recebidos:
-        # Busca dentro de divs estruturais (SEI 4)
-        div_gerados = soup.find("div", id=re.compile(r"divGerados|divProcessosGerados", re.I))
-        div_recebidos = soup.find("div", id=re.compile(r"divRecebidos|divProcessosRecebidos", re.I))
-        if div_gerados:
-            tbl_gerados = div_gerados.find("table")
-        if div_recebidos:
-            tbl_recebidos = div_recebidos.find("table")
-
-    if not tbl_gerados and not tbl_recebidos:
-        tabelas = soup.find_all("table", class_=re.compile(r"infraTable|tabelaControle", re.I))
-        if len(tabelas) >= 2:
-            tbl_recebidos = tabelas[0]
-            tbl_gerados = tabelas[1]
-        elif len(tabelas) == 1:
-            tbl_recebidos = tabelas[0]
-
     resultado["processos_gerados"] = extrair_linhas_tabela(tbl_gerados)
     resultado["processos_recebidos"] = extrair_linhas_tabela(tbl_recebidos)
-
-    # Fallback amplo caso tabelas não sigam padrão usual
-    if not resultado["processos_gerados"] and not resultado["processos_recebidos"]:
-        for a in soup.find_all("a"):
-            num = clean_html_entities(a.get_text())
-            href = a.get("href", "")
-            onclick = a.get("onclick", "")
-            if re.search(r"^\d{11,17}$|^\d{4,}\.\d{4,}|\d+/\d{4}", num):
-                id_p = _extrair_id_procedimento(href) or _extrair_id_procedimento(onclick)
-                resultado["processos_recebidos"].append({
-                    "numero": num,
-                    "id_procedimento": id_p,
-                    "href": href,
-                    "tipo": "",
-                    "usuario_atribuido": "",
-                    "detalhes": "",
-                })
 
     return resultado
 
@@ -269,10 +234,9 @@ def parse_controle_processos(html: str) -> Dict[str, List[Dict[str, Any]]]:
 def parse_arvore_processo(html: str) -> Dict[str, Any]:
     """
     Analisa a árvore de documentos de um processo no SEI.
-    Extrai metadados do processo e lista de documentos/anexos a partir de HTML estático
-    e de arrays JavaScript (infraArvoreNo / Nos[...]).
+    Extrai metadados do processo e lista de documentos/anexos a partir de nós JavaScript
+    (Nos[...] = new infraArvoreNo(...) e Nos[...].src = '...') e tags HTML.
     """
-    soup = BeautifulSoup(html, "html.parser")
     dados_processo: Dict[str, Any] = {
         "numero_processo": None,
         "tipo_processo": None,
@@ -281,19 +245,66 @@ def parse_arvore_processo(html: str) -> Dict[str, Any]:
         "documentos": [],
     }
 
-    # Metadados do processo nos textos
-    for elem in soup.find_all(["span", "div", "td", "label", "p"]):
-        txt = clean_html_entities(elem.get_text())
-        if "Tipo do Processo:" in txt or "Tipo:" in txt:
-            dados_processo["tipo_processo"] = txt.split(":")[-1].strip()
-        elif "Especificação:" in txt:
-            dados_processo["especificacao"] = txt.split(":")[-1].strip()
-        elif "Interessado" in txt and ":" in txt:
-            interessado = txt.split(":")[-1].strip()
-            if interessado and interessado not in dados_processo["interessados"]:
-                dados_processo["interessados"].append(interessado)
+    # 1. Mapeamento de Nos[X].src no script
+    nodes_src: Dict[int, str] = {}
+    for line in html.split("\n"):
+        m_src = re.search(r'Nos\[(\d+)\]\.src\s*=\s*[\'"]([^\'"]+)[\'"]', line)
+        if m_src:
+            nodes_src[int(m_src.group(1))] = m_src.group(2)
 
-    # 1. Extrai nós a partir de tags HTML <a>
+    # 2. Parsing de Nos[X] = new infraArvoreNo(...)
+    for line in html.split("\n"):
+        m_no = re.search(r'Nos\[(\d+)\]\s*=\s*new\s+infraArvoreNo\((.*?)\);', line)
+        if m_no:
+            idx = int(m_no.group(1))
+            args = re.findall(r'"([^"]*)"|\'([^\']*)\'', m_no.group(2))
+            clean_args = [a[0] if a[0] != "" else a[1] for a in args]
+
+            if len(clean_args) >= 6:
+                tipo = clean_args[0]
+                id_item = clean_args[1]
+                id_pai = clean_args[2]
+                href = clean_args[3]
+                nome = clean_html_entities(clean_args[5])
+                src_url = nodes_src.get(idx) or href
+
+                if tipo == "PROCESSO" and not dados_processo["numero_processo"]:
+                    dados_processo["numero_processo"] = nome
+
+                if tipo == "DOCUMENTO" and id_item:
+                    tipo_doc = nome.split()[0] if " " in nome else nome
+                    if not any(d["id_documento"] == id_item for d in dados_processo["documentos"]):
+                        dados_processo["documentos"].append({
+                            "id_documento": id_item,
+                            "id_procedimento": id_pai if id_pai and id_pai.isdigit() else None,
+                            "nome": nome,
+                            "tipo": tipo_doc,
+                            "assinado": "assinado" in src_url.lower() or "caneta" in src_url.lower(),
+                            "href": src_url,
+                        })
+            elif len(clean_args) >= 4:
+                id_item = clean_args[0]
+                id_pai = clean_args[1]
+                nome = clean_html_entities(clean_args[2])
+                href = clean_args[3]
+                src_url = nodes_src.get(idx) or href
+
+                m_doc = re.search(r"id_documento=(\d+)", href) or re.search(r"id_documento=(\d+)", id_item)
+                if m_doc:
+                    id_doc = m_doc.group(1)
+                    tipo_doc = nome.split()[0] if " " in nome else nome
+                    if not any(d["id_documento"] == id_doc for d in dados_processo["documentos"]):
+                        dados_processo["documentos"].append({
+                            "id_documento": id_doc,
+                            "id_procedimento": id_pai if id_pai and id_pai.isdigit() else None,
+                            "nome": nome,
+                            "tipo": tipo_doc,
+                            "assinado": "assinado" in src_url.lower() or "caneta" in src_url.lower(),
+                            "href": src_url,
+                        })
+
+    # 3. Fallback: Extração de nós a partir de tags HTML <a>
+    soup = BeautifulSoup(html, "html.parser")
     for link in soup.find_all("a"):
         nome_doc = clean_html_entities(link.get_text())
         href = link.get("href", "")
@@ -306,56 +317,34 @@ def parse_arvore_processo(html: str) -> Dict[str, Any]:
 
         id_proc = _extrair_id_procedimento(href) or _extrair_id_procedimento(onclick)
 
-        # Se for link de processo em si
         if ("procedimento_dados" in href or "procedimento_trabalhar" in href) and not dados_processo["numero_processo"]:
             if re.search(r"\d{4,}", nome_doc):
                 dados_processo["numero_processo"] = nome_doc
 
-        if id_doc and nome_doc:
+        if id_doc and nome_doc and not any(d["id_documento"] == id_doc for d in dados_processo["documentos"]):
             tipo_doc = nome_doc.split()[0] if " " in nome_doc else nome_doc
             assinado = bool(link.parent and link.parent.find("img", src=re.compile(r"assin|caneta", re.I)))
-
-            # Evita duplicatas
-            if not any(d["id_documento"] == id_doc for d in dados_processo["documentos"]):
-                dados_processo["documentos"].append({
-                    "id_documento": id_doc,
-                    "id_procedimento": id_proc,
-                    "nome": nome_doc,
-                    "tipo": tipo_doc,
-                    "assinado": assinado,
-                    "href": href,
-                })
-
-    # 2. Extrai nós gerados em JavaScript pelo InfraArvore do SEI (ex: Nos[X] = new infraArvoreNo(...))
-    # Padrão: infraArvoreNo('D12345', 'P9876', 'Despacho 10 (12345)', 'controlador.php?acao=documento_visualizar&id_documento=12345...', ...)
-    js_pattern = re.compile(
-        r"infraArvoreNo\s*\(\s*['\"](?P<id_no>[^'\"]+)['\"]\s*,\s*['\"](?P<pai>[^'\"]*)['\"]\s*,\s*['\"](?P<nome>[^'\"]+)['\"]\s*,\s*['\"](?P<href>[^'\"]+)['\"]",
-        re.I,
-    )
-    for m in js_pattern.finditer(html):
-        nome_doc = clean_html_entities(m.group("nome"))
-        href_doc = m.group("href")
-        
-        m_doc = re.search(r"id_documento=(\d+)", href_doc)
-        id_doc = m_doc.group(1) if m_doc else None
-        id_proc = _extrair_id_procedimento(href_doc)
-
-        if not id_doc and ("procedimento_dados" in href_doc or "procedimento_trabalhar" in href_doc):
-            if not dados_processo["numero_processo"]:
-                dados_processo["numero_processo"] = nome_doc
-
-        if id_doc and not any(d["id_documento"] == id_doc for d in dados_processo["documentos"]):
-            tipo_doc = nome_doc.split()[0] if " " in nome_doc else nome_doc
             dados_processo["documentos"].append({
                 "id_documento": id_doc,
                 "id_procedimento": id_proc,
                 "nome": nome_doc,
                 "tipo": tipo_doc,
-                "assinado": "assinado" in href_doc.lower() or "caneta" in href_doc.lower(),
-                "href": href_doc,
+                "assinado": assinado,
+                "href": href,
             })
 
-    # 3. Se ainda não encontrou número do processo, procura regex de protocolo no texto
+    # 4. Extrai metadados do processo
+    for elem in soup.find_all(["span", "div", "td", "label", "p"]):
+        txt = clean_html_entities(elem.get_text())
+        if "Tipo do Processo:" in txt or "Tipo:" in txt:
+            dados_processo["tipo_processo"] = txt.split(":")[-1].strip()
+        elif "Especificação:" in txt:
+            dados_processo["especificacao"] = txt.split(":")[-1].strip()
+        elif "Interessado" in txt and ":" in txt:
+            interessado = txt.split(":")[-1].strip()
+            if interessado and interessado not in dados_processo["interessados"]:
+                dados_processo["interessados"].append(interessado)
+
     if not dados_processo["numero_processo"]:
         m_prot = re.search(r"\b(\d{15,17}|\d{5}\.\d{6}/\d{4}-\d{2})\b", html)
         if m_prot:
@@ -385,14 +374,15 @@ def parse_conteudo_documento(html: str) -> Dict[str, Any]:
         "html_limpo": "",
     }
 
-    # Detecta se há iframe com anexo/download
-    iframe = soup.find("iframe", id=re.compile(r"ifrVisualizacao|ifrConteudo", re.I)) or soup.find("iframe")
-    if iframe and iframe.get("src"):
+    iframe = soup.find("iframe", id=re.compile(r"ifrVisualizacao|ifrConteudo|ifrArvoreHtml", re.I)) or soup.find("iframe")
+    if iframe and iframe.get("src") and iframe.get("src") != "about:blank":
         resultado["url_anexo_iframe"] = iframe.get("src")
 
-    titulo_elem = soup.find(["h1", "h2", "p"], class_=re.compile(r"titulo|docTitulo|infraTitulo", re.I))
+    titulo_elem = soup.find(["h1", "h2", "p", "title"], class_=re.compile(r"titulo|docTitulo|infraTitulo", re.I))
     if titulo_elem:
         resultado["titulo"] = clean_html_entities(titulo_elem.get_text())
+    elif soup.title:
+        resultado["titulo"] = clean_html_entities(soup.title.get_text())
 
     blocos_assinatura = soup.find_all(string=re.compile(r"assinado eletronicamente por|assinatura eletrônica", re.I))
     for ass in blocos_assinatura:
@@ -425,19 +415,17 @@ def parse_conteudo_documento(html: str) -> Dict[str, Any]:
 
 def parse_pesquisa_processos(html: str) -> List[Dict[str, Any]]:
     """
-    Analisa os resultados de uma pesquisa rápida ou avançada no SEI.
-    Extrai processos e documentos listados na página.
+    Analisa os resultados de uma pesquisa no SEI.
     """
     soup = BeautifulSoup(html, "html.parser")
     resultados: List[Dict[str, Any]] = []
 
-    # 1. Procura por linhas de tabela
     tabelas = soup.find_all("table", class_=re.compile(r"infraTable|tabelaControle|resultado", re.I)) or soup.find_all("table")
     for tabela in tabelas:
         for tr in tabela.find_all("tr"):
-            link = tr.find("a", href=re.compile(r"procedimento_trabalhar|documento_visualizar|id_procedimento=|id_documento=", re.I))
+            link = tr.find("a", href=re.compile(r"procedimento_trabalhar|documento_visualizar|id_procedimento=|id_documento=|id_protocolo=", re.I))
             if not link:
-                link = tr.find("a", onclick=re.compile(r"procedimento_trabalhar|documento_visualizar|id_procedimento=|id_documento=", re.I))
+                link = tr.find("a", onclick=re.compile(r"procedimento_trabalhar|documento_visualizar|id_procedimento=|id_documento=|id_protocolo=", re.I))
 
             if not link:
                 continue
@@ -446,13 +434,13 @@ def parse_pesquisa_processos(html: str) -> List[Dict[str, Any]]:
             href = link.get("href", "")
             onclick = link.get("onclick", "")
             item_id = _extrair_id_procedimento(href) or _extrair_id_procedimento(onclick)
-            
+
             m_doc = re.search(r"id_documento=(\d+)", href) or re.search(r"id_documento=(\d+)", onclick)
             id_doc = m_doc.group(1) if m_doc else None
 
             resumo = clean_html_entities(tr.get_text(" | "))
 
-            if not any(r["id"] == (item_id or id_doc) and r["numero"] == num for r in resultados):
+            if not any(r["numero"] == num and r["id"] == (item_id or id_doc) for r in resultados):
                 resultados.append({
                     "numero": num,
                     "id": item_id or id_doc,
@@ -462,28 +450,7 @@ def parse_pesquisa_processos(html: str) -> List[Dict[str, Any]]:
                     "resumo": resumo,
                 })
 
-    # 2. Procura em divs de resultados (SEI 4)
-    divs_resultado = soup.find_all("div", class_=re.compile(r"resultadoPesquisa|pesquisaResultado|resultadoItem", re.I))
-    for div in divs_resultado:
-        link = div.find("a")
-        if not link:
-            continue
-        num = clean_html_entities(link.get_text())
-        href = link.get("href", "")
-        onclick = link.get("onclick", "")
-        item_id = _extrair_id_procedimento(href) or _extrair_id_procedimento(onclick)
-        resumo = clean_html_entities(div.get_text(" | "))
-
-        if not any(r["numero"] == num for r in resultados):
-            resultados.append({
-                "numero": num,
-                "id": item_id,
-                "id_procedimento": item_id,
-                "link": href or onclick,
-                "resumo": resumo,
-            })
-
-    # 3. Fallback: Qualquer link com padrão de processo ou id_procedimento
+    # Fallback amplo
     if not resultados:
         for a in soup.find_all("a"):
             num = clean_html_entities(a.get_text())

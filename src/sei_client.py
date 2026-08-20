@@ -1,15 +1,16 @@
 """
 Cliente HTTP para o SEI (Sistema Eletrônico de Informações)
 Responsável por gerenciar o ciclo de vida da sessão web, autenticação com usuário/senha/órgão,
-manutenção de cookies e execução das requisições ao sistema.
+manutenção de cookies e execução das requisições ao sistema com suporte a URLs assinadas (infra_hash).
 """
 
 import logging
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
+from bs4 import BeautifulSoup
 
 from src.config import SeiSettings, get_settings
 from src.parsers import (
@@ -38,13 +39,17 @@ class SeiAuthenticationError(SeiClientError):
 
 class SeiClient:
     """
-    Cliente de integração HTTP com o SEI baseado em emulação de sessão web.
+    Cliente de integração HTTP com o SEI baseado em emulação de sessão web e URLs assinadas.
     """
 
     def __init__(self, settings: Optional[SeiSettings] = None):
         self.settings = settings or get_settings()
         self._is_logged_in = False
         self._session_info: Dict[str, Any] = {}
+        self._home_url: Optional[str] = None
+        self._home_html: Optional[str] = None
+        self._search_form_url: Optional[str] = None
+        self._doc_urls_cache: Dict[str, str] = {}  # {id_documento: signed_url}
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -73,7 +78,7 @@ class SeiClient:
 
     async def _ensure_logged_in(self):
         """Garante que o cliente esteja autenticado antes de executar uma ação."""
-        if not self._is_logged_in:
+        if not self._is_logged_in or not self._home_url:
             await self.login()
 
     async def login(
@@ -85,7 +90,7 @@ class SeiClient:
         unidade: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Executa o fluxo completo de autenticação no SEI.
+        Executa o fluxo completo de autenticação no SEI e captura as rotas assinadas da sessão.
         """
         if base_url:
             self.settings.base_url = base_url.strip().rstrip("/")
@@ -172,21 +177,18 @@ class SeiClient:
             self._is_logged_in = False
             raise SeiAuthenticationError(f"Falha na autenticação do SEI: {erro_msg}")
 
+        # Salva o estado da tela principal com as URLs assinadas
+        self._home_url = str(resp_login.url)
+        self._home_html = login_html
         self._session_info = parse_session_info(login_html)
 
-        # Atualiza dados de sessão acessando a tela de controle
-        ctrl_url = self._build_url("controlador.php?acao=procedimento_controle")
-        try:
-            resp_ctrl = await self.http_client.get(ctrl_url)
-            info_ctrl = parse_session_info(resp_ctrl.text)
-            if info_ctrl.get("usuario_logado"):
-                self._session_info["usuario_logado"] = info_ctrl["usuario_logado"]
-            if info_ctrl.get("unidade_atual"):
-                self._session_info["unidade_atual"] = info_ctrl["unidade_atual"]
-            if info_ctrl.get("unidades_disponiveis"):
-                self._session_info["unidades_disponiveis"] = info_ctrl["unidades_disponiveis"]
-        except Exception:
-            pass
+        # Captura a URL assinada da barra de pesquisa
+        soup_home = BeautifulSoup(login_html, "html.parser")
+        form_pesq = soup_home.find("form", id=re.compile(r"frmPesquisa|frmProtocoloPesquisa|frmPesquisaRapida", re.I)) or soup_home.find("form", action=re.compile(r"pesquisa", re.I))
+        if form_pesq and form_pesq.get("action"):
+            self._search_form_url = urljoin(self._home_url, form_pesq.get("action"))
+        else:
+            self._search_form_url = self._build_url("controlador.php?acao=protocolo_pesquisa_rapida")
 
         self._is_logged_in = True
         logger.info(f"Login no SEI efetuado com sucesso! Unidade atual: {self._session_info.get('unidade_atual')}")
@@ -223,8 +225,10 @@ class SeiClient:
                 break
 
         url_troca = self._build_url(f"controlador.php?acao=infra_selecionar_unidade&id_unidade={id_unidade}")
-        resp = await self.http_client.get(url_troca)
+        resp = await self.http_client.get(url_troca, headers={"Referer": self._home_url or self.settings.base_url})
         
+        self._home_url = str(resp.url)
+        self._home_html = resp.text
         self._session_info = parse_session_info(resp.text)
         return {
             "sucesso": True,
@@ -238,16 +242,18 @@ class SeiClient:
         da unidade atual (Processos Gerados e Processos Recebidos).
         """
         await self._ensure_logged_in()
-        url = self._build_url("controlador.php?acao=procedimento_controle")
         
-        resp = await self.http_client.get(url)
+        # Acessa a URL da home assinada
+        url = self._home_url or self._build_url("controlador.php?acao=procedimento_controlar")
+        resp = await self.http_client.get(url, headers={"Referer": self._home_url or self.settings.base_url})
         resp.raise_for_status()
 
         if "acao=login" in str(resp.url) or parse_login_error(resp.text):
             logger.info("Sessão expirada. Renovando autenticação...")
             await self.login()
-            resp = await self.http_client.get(url)
+            resp = await self.http_client.get(self._home_url or url)
 
+        self._home_html = resp.text
         dados = parse_controle_processos(resp.text)
         status = self.get_status()
         
@@ -261,250 +267,163 @@ class SeiClient:
 
     async def pesquisar(self, termo: str) -> Dict[str, Any]:
         """
-        Realiza busca de processos ou documentos no SEI usando múltiplas estratégias HTTP (POST e GET).
+        Realiza busca de processos ou documentos no SEI usando a rota de pesquisa assinada.
         """
         await self._ensure_logged_in()
         termo = termo.strip()
         
-        resultados: List[Dict[str, Any]] = []
-
-        # Estratégia 1: POST para protocolo_pesquisar_rapida (Padrão SEI 3/4)
-        url_p1 = self._build_url("controlador.php?acao=protocolo_pesquisar_rapida")
-        payload_p1 = {
+        url_pesq = self._search_form_url or self._build_url("controlador.php?acao=protocolo_pesquisa_rapida")
+        payload = {
             "txtPesquisaRapida": termo,
             "chkSinProcessos": "S",
             "chkSinDocumentos": "S",
-            "acao": "protocolo_pesquisar_rapida",
-            "sbmPesquisar": "Pesquisar",
         }
-        try:
-            resp1 = await self.http_client.post(url_p1, data=payload_p1)
-            # Verifica se redirecionou direto para o processo
-            id_p = _extrair_id_procedimento(str(resp1.url)) or _extrair_id_procedimento(resp1.text)
-            if id_p and ("procedimento_trabalhar" in str(resp1.url) or "arvore_visualizar" in resp1.text):
-                resultados.append({
-                    "numero": termo,
-                    "id": id_p,
-                    "id_procedimento": id_p,
-                    "link": str(resp1.url),
-                    "resumo": f"Processo localizado diretamente: {termo}",
-                })
-            else:
-                res1 = parse_pesquisa_processos(resp1.text)
-                if res1:
-                    resultados.extend(res1)
-        except Exception as e:
-            logger.debug(f"Estratégia 1 falhou: {e}")
+        
+        resp = await self.http_client.post(url_pesq, data=payload, headers={"Referer": self._home_url or self.settings.base_url})
+        
+        if "acao=login" in str(resp.url) or parse_login_error(resp.text):
+            await self.login()
+            url_pesq = self._search_form_url or self._build_url("controlador.php?acao=protocolo_pesquisa_rapida")
+            resp = await self.http_client.post(url_pesq, data=payload, headers={"Referer": self._home_url or self.settings.base_url})
 
-        # Estratégia 2: Se não encontrou, tenta POST para protocolo_pesquisar
-        if not resultados:
-            url_p2 = self._build_url("controlador.php?acao=protocolo_pesquisar")
-            payload_p2 = {
-                "txtProtocoloPesquisa": termo,
-                "txtPalavraChavePesquisa": termo,
-                "chkSinProcessos": "S",
-                "chkSinDocumentos": "S",
-                "acao": "protocolo_pesquisar",
-                "sbmPesquisar": "Pesquisar",
-            }
-            try:
-                resp2 = await self.http_client.post(url_p2, data=payload_p2)
-                id_p = _extrair_id_procedimento(str(resp2.url)) or _extrair_id_procedimento(resp2.text)
-                if id_p and ("procedimento_trabalhar" in str(resp2.url) or "arvore_visualizar" in resp2.text):
-                    resultados.append({
-                        "numero": termo,
-                        "id": id_p,
-                        "id_procedimento": id_p,
-                        "link": str(resp2.url),
-                        "resumo": f"Processo localizado diretamente: {termo}",
-                    })
-                else:
-                    res2 = parse_pesquisa_processos(resp2.text)
-                    if res2:
-                        resultados.extend(res2)
-            except Exception as e:
-                logger.debug(f"Estratégia 2 falhou: {e}")
+        resultados: List[Dict[str, Any]] = []
 
-        # Estratégia 3: POST pesquisa_rapida
-        if not resultados:
-            url_p3 = self._build_url("controlador.php?acao=pesquisa_rapida")
-            payload_p3 = {
-                "txtPesquisaRapida": termo,
-                "chkSinProcessos": "S",
-                "chkSinDocumentos": "S",
-                "acao": "pesquisa_rapida",
-            }
-            try:
-                resp3 = await self.http_client.post(url_p3, data=payload_p3)
-                res3 = parse_pesquisa_processos(resp3.text)
-                if res3:
-                    resultados.extend(res3)
-            except Exception as e:
-                logger.debug(f"Estratégia 3 falhou: {e}")
-
-        # Estratégia 4: GET com parâmetros na URL
-        if not resultados:
-            url_p4 = self._build_url(
-                f"controlador.php?acao=protocolo_pesquisar_rapida&txtPesquisaRapida={termo}&chkSinProcessos=S&chkSinDocumentos=S"
-            )
-            try:
-                resp4 = await self.http_client.get(url_p4)
-                res4 = parse_pesquisa_processos(resp4.text)
-                if res4:
-                    resultados.extend(res4)
-            except Exception as e:
-                logger.debug(f"Estratégia 4 falhou: {e}")
-
-        # Deduplicação de resultados por ID / Número
-        unicos = []
-        vistos = set()
-        for r in resultados:
-            chave = (r.get("id"), r.get("numero"))
-            if chave not in vistos:
-                vistos.add(chave)
-                unicos.append(r)
+        # Caso 1: Redirecionamento direto para a tela do processo (procedimento_trabalhar)
+        id_p = _extrair_id_procedimento(str(resp.url)) or _extrair_id_procedimento(resp.text)
+        if id_p and ("procedimento_trabalhar" in str(resp.url) or "id_protocolo=" in str(resp.url)):
+            resultados.append({
+                "numero": termo,
+                "id": id_p,
+                "id_procedimento": id_p,
+                "link": str(resp.url),
+                "resumo": f"Processo localizado diretamente: {termo}",
+            })
+        else:
+            # Caso 2: Tabela de resultados de pesquisa
+            res_lista = parse_pesquisa_processos(resp.text)
+            resultados.extend(res_lista)
 
         return {
             "termo_pesquisado": termo,
-            "total_encontrados": len(unicos),
-            "resultados": unicos,
+            "total_encontrados": len(resultados),
+            "resultados": resultados,
         }
 
     async def consultar_processo(self, numero_ou_id: str) -> Dict[str, Any]:
         """
         Consulta informações e a árvore de documentos de um processo no SEI.
-        Resolve automaticamente tanto números de protocolo (ex: 202600011025521 ou 00053.000123/2026-10)
-        quanto IDs internos numéricos.
+        Resolve números de protocolo (ex: 202600011025521 ou 202300011005879) e IDs internos.
         """
         await self._ensure_logged_in()
         param = numero_ou_id.strip()
 
-        id_proc: Optional[str] = None
+        # Executa pesquisa pelo termo
+        url_pesq = self._search_form_url or self._build_url("controlador.php?acao=protocolo_pesquisa_rapida")
+        payload = {"txtPesquisaRapida": param}
+        
+        resp = await self.http_client.post(url_pesq, data=payload, headers={"Referer": self._home_url or self.settings.base_url})
+        
+        if "acao=login" in str(resp.url) or parse_login_error(resp.text):
+            await self.login()
+            url_pesq = self._search_form_url or self._build_url("controlador.php?acao=protocolo_pesquisa_rapida")
+            resp = await self.http_client.post(url_pesq, data=payload, headers={"Referer": self._home_url or self.settings.base_url})
 
-        # 1. Se for ID curto (<= 8 dígitos) estritamente numérico, tenta abrir diretamente
-        if param.isdigit() and len(param) <= 8:
-            try:
-                dados_direto = await self.obter_arvore_processo(param)
-                if dados_direto.get("documentos") or dados_direto.get("numero_processo"):
-                    return dados_direto
-            except Exception:
-                pass
+        # Verifica se abriu a tela do processo diretamente
+        soup_proc = BeautifulSoup(resp.text, "html.parser")
+        ifr_arvore = soup_proc.find("iframe", id=re.compile(r"ifrArvore", re.I)) or soup_proc.find("iframe")
 
-        # 2. Busca o número do processo usando o mecanismo multi-estratégia de pesquisa
-        pesquisa_res = await self.pesquisar(param)
-        for r in pesquisa_res.get("resultados", []):
-            if r.get("id_procedimento"):
-                id_proc = r["id_procedimento"]
-                break
-            elif r.get("id") and str(r.get("id")).isdigit() and len(str(r.get("id"))) <= 10:
-                id_proc = str(r["id"])
-                break
+        url_arvore_src = None
+        if ifr_arvore and ifr_arvore.get("src"):
+            url_arvore_src = urljoin(str(resp.url), ifr_arvore.get("src"))
 
-        # 3. Se não encontrou e o termo possui caracteres não-dígitos (pontos, traços), tenta sem pontuação
-        if not id_proc:
-            termo_limpo = re.sub(r"\D", "", param)
-            if termo_limpo and termo_limpo != param:
-                pesq_limpo = await self.pesquisar(termo_limpo)
-                for r in pesq_limpo.get("resultados", []):
-                    if r.get("id_procedimento"):
-                        id_proc = r["id_procedimento"]
-                        break
-                    elif r.get("id"):
-                        id_proc = str(r["id"])
-                        break
+        if not url_arvore_src:
+            # Se não abriu direto, procura link de processo nos resultados da pesquisa
+            link_proc = soup_proc.find("a", href=re.compile(r"procedimento_trabalhar|procedimento_controlar|id_procedimento=", re.I))
+            if link_proc and link_proc.get("href"):
+                url_abrir = urljoin(str(resp.url), link_proc.get("href"))
+                resp_abrir = await self.http_client.get(url_abrir, headers={"Referer": str(resp.url)})
+                soup_abrir = BeautifulSoup(resp_abrir.text, "html.parser")
+                ifr_arvore = soup_abrir.find("iframe", id=re.compile(r"ifrArvore", re.I)) or soup_abrir.find("iframe")
+                if ifr_arvore and ifr_arvore.get("src"):
+                    url_arvore_src = urljoin(str(resp_abrir.url), ifr_arvore.get("src"))
 
-        # 4. Tenta abertura direta via procedimento_dados / procedimento_trabalhar com o número
-        if not id_proc:
-            url_tentativa = self._build_url(f"controlador.php?acao=procedimento_trabalhar&id_procedimento={param}")
-            try:
-                resp_t = await self.http_client.get(url_tentativa)
-                id_ext = _extrair_id_procedimento(str(resp_t.url)) or _extrair_id_procedimento(resp_t.text)
-                if id_ext:
-                    id_proc = id_ext
-            except Exception:
-                pass
-
-        if not id_proc:
+        if not url_arvore_src:
             raise SeiClientError(
                 f"Processo '{numero_ou_id}' não foi localizado no SEI. "
-                f"Verifique se o número está correto ou se a sua unidade atual ({self._session_info.get('unidade_atual')}) possui permissão de acesso a este processo."
+                f"Verifique se o número está correto ou se a unidade ({self._session_info.get('unidade_atual')}) possui permissão de acesso."
             )
 
-        return await self.obter_arvore_processo(id_proc)
+        # Obtém a árvore completa a partir do iframe da árvore
+        resp_arv = await self.http_client.get(url_arvore_src, headers={"Referer": str(resp.url)})
+        resp_arv.raise_for_status()
+
+        dados_arvore = parse_arvore_processo(resp_arv.text)
+        dados_arvore["id_procedimento"] = _extrair_id_procedimento(url_arvore_src)
+        if not dados_arvore.get("numero_processo"):
+            dados_arvore["numero_processo"] = param
+
+        # Popula o cache de URLs dos documentos para leitura rápida posterior
+        for doc in dados_arvore.get("documentos", []):
+            if doc.get("id_documento") and doc.get("href"):
+                full_href = urljoin(str(resp_arv.url), doc["href"])
+                self._doc_urls_cache[doc["id_documento"]] = full_href
+
+        return dados_arvore
 
     async def obter_arvore_processo(self, id_procedimento: str) -> Dict[str, Any]:
         """
-        Obtém a árvore completa de documentos e metadados de um processo a partir do id_procedimento.
+        Obtém a árvore completa de documentos de um processo.
         """
-        await self._ensure_logged_in()
-        
-        # 1. Consulta a tela de trabalho do procedimento
-        url_trab = self._build_url(f"controlador.php?acao=procedimento_trabalhar&id_procedimento={id_procedimento}")
-        resp_trab = await self.http_client.get(url_trab)
-        resp_trab.raise_for_status()
-
-        # 2. Consulta o endpoint específico da árvore (onde o SEI renderiza os nós e scripts)
-        url_arvore = self._build_url(f"controlador.php?acao=arvore_visualizar&id_procedimento={id_procedimento}")
-        try:
-            resp_arvore = await self.http_client.get(url_arvore)
-            html_arvore = resp_arvore.text
-        except Exception:
-            html_arvore = ""
-
-        # Mescla os dados extraídos de ambas as páginas
-        dados = parse_arvore_processo(html_arvore or resp_trab.text)
-        
-        # Se na árvore não veio metadados como interessados/tipo, busca em procedimento_dados
-        if not dados.get("tipo_processo") or not dados.get("documentos"):
-            dados_complementares = parse_arvore_processo(resp_trab.text)
-            if not dados.get("tipo_processo"):
-                dados["tipo_processo"] = dados_complementares.get("tipo_processo")
-            if not dados.get("numero_processo"):
-                dados["numero_processo"] = dados_complementares.get("numero_processo")
-            if not dados.get("interessados"):
-                dados["interessados"] = dados_complementares.get("interessados")
-            for doc in dados_complementares.get("documentos", []):
-                if not any(d["id_documento"] == doc["id_documento"] for d in dados["documentos"]):
-                    dados["documentos"].append(doc)
-
-        dados["id_procedimento"] = id_procedimento
-        return dados
+        return await self.consultar_processo(id_procedimento)
 
     async def ler_documento(self, id_documento: str, id_procedimento: Optional[str] = None) -> Dict[str, Any]:
         """
         Lê o conteúdo em texto e dados de assinatura de um documento específico no SEI.
-        Se o documento for carregado em um iframe interno, o cliente segue o link para extrair o texto.
         """
         await self._ensure_logged_in()
         
-        params = f"acao=documento_visualizar&id_documento={id_documento}"
-        if id_procedimento:
-            params += f"&id_procedimento={id_procedimento}"
+        # 1. Tenta recuperar a URL assinada direta do cache
+        url_doc = self._doc_urls_cache.get(id_documento)
 
-        url = self._build_url(f"controlador.php?{params}")
-        resp = await self.http_client.get(url)
+        # 2. Se não estiver em cache, consulta o processo correspondente para popular
+        if not url_doc and id_procedimento:
+            await self.consultar_processo(id_procedimento)
+            url_doc = self._doc_urls_cache.get(id_documento)
+
+        if not url_doc:
+            # Fallback para pesquisa do próprio ID do documento
+            res_pesq = await self.pesquisar(id_documento)
+            if res_pesq.get("resultados"):
+                link_res = res_pesq["resultados"][0].get("link")
+                if link_res:
+                    url_doc = self._build_url(link_res)
+
+        if not url_doc:
+            url_doc = self._build_url(f"controlador.php?acao=documento_visualizar&id_documento={id_documento}")
+
+        resp = await self.http_client.get(url_doc, headers={"Referer": self._home_url or self.settings.base_url})
         resp.raise_for_status()
 
-        if "acao=login" in str(resp.url):
+        if "acao=login" in str(resp.url) or parse_login_error(resp.text):
             await self.login()
-            resp = await self.http_client.get(url)
+            resp = await self.http_client.get(url_doc, headers={"Referer": self._home_url or self.settings.base_url})
 
         conteudo = parse_conteudo_documento(resp.text)
         conteudo["id_documento"] = id_documento
         conteudo["id_procedimento"] = id_procedimento
         conteudo["url_documento"] = str(resp.url)
 
-        # Se houver um iframe de conteúdo (ex: documento gerado pelo SEI ou conversão)
+        # Se houver iframe interno no documento, busca o conteúdo dentro dele
         if conteudo.get("url_anexo_iframe"):
-            url_iframe = self._build_url(conteudo["url_anexo_iframe"])
+            url_iframe = urljoin(str(resp.url), conteudo["url_anexo_iframe"])
             try:
-                resp_iframe = await self.http_client.get(url_iframe)
-                if resp_iframe.status_code == 200 and len(resp_iframe.text) > 50:
-                    conteudo_iframe = parse_conteudo_documento(resp_iframe.text)
-                    if conteudo_iframe.get("conteudo_texto"):
-                        conteudo["conteudo_texto"] = conteudo_iframe["conteudo_texto"]
-                    if conteudo_iframe.get("assinaturas"):
-                        conteudo["assinaturas"].extend(conteudo_iframe["assinaturas"])
+                resp_iframe = await self.http_client.get(url_iframe, headers={"Referer": str(resp.url)})
+                if resp_iframe.status_code == 200 and len(resp_iframe.text) > 30:
+                    c_iframe = parse_conteudo_documento(resp_iframe.text)
+                    if c_iframe.get("conteudo_texto"):
+                        conteudo["conteudo_texto"] = c_iframe["conteudo_texto"]
+                    if c_iframe.get("assinaturas"):
+                        conteudo["assinaturas"].extend(c_iframe["assinaturas"])
             except Exception as e:
                 logger.debug(f"Não foi possível carregar o iframe do documento: {e}")
 
@@ -524,7 +443,7 @@ class SeiClient:
             "id_procedimento": id_procedimento,
         }
         
-        resp_post = await self.http_client.post(url_andamento, data=payload)
+        resp_post = await self.http_client.post(url_andamento, data=payload, headers={"Referer": self._home_url or self.settings.base_url})
         return {
             "sucesso": resp_post.status_code == 200,
             "mensagem": f"Andamento registrado no processo {id_procedimento} com sucesso.",
@@ -537,29 +456,32 @@ class SeiClient:
         """
         diag: Dict[str, Any] = {
             "status_sessao": self.get_status(),
+            "home_url": self._home_url,
+            "search_form_url": self._search_form_url,
             "endpoints": {},
         }
 
         # 1. Testa Controle de Processos
-        url_ctrl = self._build_url("controlador.php?acao=procedimento_controle")
         try:
-            resp_ctrl = await self.http_client.get(url_ctrl)
+            ctrl = await self.listar_controle_processos()
             diag["endpoints"]["controle_processos"] = {
-                "status_code": resp_ctrl.status_code,
-                "url_final": str(resp_ctrl.url),
-                "tamanho_html": len(resp_ctrl.text),
-                "contem_tblGerados": "tblProcessosGerados" in resp_ctrl.text or "divGerados" in resp_ctrl.text,
-                "contem_tblRecebidos": "tblProcessosRecebidos" in resp_ctrl.text or "divRecebidos" in resp_ctrl.text,
+                "sucesso": True,
+                "total_gerados": ctrl.get("total_gerados"),
+                "total_recebidos": ctrl.get("total_recebidos"),
+                "primeiros_recebidos": [p.get("numero") for p in ctrl.get("processos_recebidos", [])[:5]],
             }
         except Exception as e:
             diag["endpoints"]["controle_processos"] = {"erro": str(e)}
 
-        # 2. Testa Pesquisa com o termo
-        pesq = await self.pesquisar(termo_teste)
-        diag["endpoints"]["pesquisa_teste"] = {
-            "termo": termo_teste,
-            "total_encontrados": pesq.get("total_encontrados", 0),
-            "resultados": pesq.get("resultados", []),
-        }
+        # 2. Testa Pesquisa e Abertura do Processo de Referência
+        try:
+            proc = await self.consultar_processo(termo_teste)
+            diag["endpoints"]["processo_teste"] = {
+                "numero_processo": proc.get("numero_processo"),
+                "total_documentos": len(proc.get("documentos", [])),
+                "primeiros_documentos": [d.get("nome") for d in proc.get("documentos", [])[:5]],
+            }
+        except Exception as e:
+            diag["endpoints"]["processo_teste"] = {"erro": str(e)}
 
         return diag
