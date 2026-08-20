@@ -29,7 +29,7 @@ logger = logging.getLogger("mcp_sei.server")
 mcp = MCPApp(
     name="SEI - Sistema Eletrônico de Informações",
     instructions="""Servidor MCP para integração e automação com o SEI (Sistema Eletrônico de Informações).
-Permite consultar processos, listar a caixa de entrada da unidade, obter árvores de documentos, ler o teor de minutas e despachos, pesquisar processos e gerenciar a unidade de trabalho atual no SEI.""",
+Permite consultar processos, listar a caixa de entrada da unidade, obter árvores de documentos, ler o teor de minutas e despachos, incluir novos documentos, pesquisar processos e gerenciar a unidade de trabalho atual no SEI.""",
 )
 
 # Instância global do cliente SEI
@@ -127,6 +127,40 @@ async def sei_obter_arvore_processo(id_procedimento: str) -> str:
         return json.dumps(arvore, indent=2, ensure_ascii=False)
     except Exception as e:
         return f"Erro ao obter árvore do processo '{id_procedimento}': {str(e)}"
+
+
+@mcp.tool(
+    name="sei_incluir_documento",
+    description="Inclui um novo documento interno (ex: Ordem de Serviço, Relatório, Ofício) em um processo do SEI, opcionalmente copiando o texto de um documento existente como conteúdo inicial. NÃO edita o corpo/conteúdo do documento além do texto-base copiado — a redação fina (CKEditor) ainda precisa ser feita manualmente no navegador depois."
+)
+async def sei_incluir_documento(
+    id_procedimento: str,
+    tipo: str,
+    descricao: str = "",
+    id_documento_modelo: Optional[str] = None,
+    nivel_acesso: str = "0",
+) -> str:
+    """
+    Cria um novo documento dentro de um processo no SEI.
+
+    Args:
+        id_procedimento: Número do processo (ex: 202600011025521) ou id interno.
+        tipo: Nome do tipo de documento (ex: "Ordem de Serviço", "Relatório", "Ofício") ou o id_serie numérico direto.
+        descricao: Descrição interna do documento (campo de busca — não aparece no corpo impresso).
+        id_documento_modelo: (Opcional) id interno de um documento existente cujo texto será copiado como conteúdo inicial.
+        nivel_acesso: Nível de acesso do documento: "0" Público (padrão), "1" Restrito, "2" Sigiloso.
+    """
+    try:
+        resultado = await sei_client.incluir_documento(
+            id_procedimento=id_procedimento,
+            tipo=tipo,
+            descricao=descricao,
+            id_documento_modelo=id_documento_modelo,
+            nivel_acesso=nivel_acesso,
+        )
+        return json.dumps(resultado, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"Erro ao incluir documento no processo '{id_procedimento}': {str(e)}"
 
 
 @mcp.tool(

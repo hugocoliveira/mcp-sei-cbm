@@ -6,6 +6,7 @@ manutenção de cookies e execução das requisições ao sistema com suporte a 
 
 import logging
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -309,10 +310,12 @@ class SeiClient:
             "resultados": resultados,
         }
 
-    async def consultar_processo(self, numero_ou_id: str) -> Dict[str, Any]:
+    async def _ir_para_arvore(self, numero_ou_id: str) -> httpx.Response:
         """
-        Consulta informações e a árvore de documentos de um processo no SEI.
-        Resolve números de protocolo (ex: 202600011025521 ou 202300011005879) e IDs internos.
+        Navega até a página da árvore de documentos de um processo (via busca rápida) e
+        retorna a resposta HTTP crua, já com uma URL/infra_hash válidos para a sessão atual.
+        Usado tanto por consultar_processo quanto por operações de escrita (ex: incluir_documento)
+        que precisam do link "Incluir Documento" (assinado) presente nessa página.
         """
         await self._ensure_logged_in()
         param = numero_ou_id.strip()
@@ -320,9 +323,9 @@ class SeiClient:
         # Executa pesquisa pelo termo
         url_pesq = self._search_form_url or self._build_url("controlador.php?acao=protocolo_pesquisa_rapida")
         payload = {"txtPesquisaRapida": param}
-        
+
         resp = await self.http_client.post(url_pesq, data=payload, headers={"Referer": self._home_url or self.settings.base_url})
-        
+
         if "acao=login" in str(resp.url) or parse_login_error(resp.text):
             await self.login()
             url_pesq = self._search_form_url or self._build_url("controlador.php?acao=protocolo_pesquisa_rapida")
@@ -356,6 +359,16 @@ class SeiClient:
         # Obtém a árvore completa a partir do iframe da árvore
         resp_arv = await self.http_client.get(url_arvore_src, headers={"Referer": str(resp.url)})
         resp_arv.raise_for_status()
+        return resp_arv
+
+    async def consultar_processo(self, numero_ou_id: str) -> Dict[str, Any]:
+        """
+        Consulta informações e a árvore de documentos de um processo no SEI.
+        Resolve números de protocolo (ex: 202600011025521 ou 202300011005879) e IDs internos.
+        """
+        resp_arv = await self._ir_para_arvore(numero_ou_id)
+        param = numero_ou_id.strip()
+        id_procedimento_resolvido = _extrair_id_procedimento(str(resp_arv.url))
 
         # Processos grandes têm a árvore paginada em "Pastas" (Pasta I, Pasta II, ...).
         # Por padrão só a última pasta vem carregada na resposta acima (demais nós ficam
@@ -373,7 +386,7 @@ class SeiClient:
                 resp_arv = resp_abrir
 
         dados_arvore = parse_arvore_processo(resp_arv.text)
-        dados_arvore["id_procedimento"] = _extrair_id_procedimento(url_arvore_src)
+        dados_arvore["id_procedimento"] = id_procedimento_resolvido
         if not dados_arvore.get("numero_processo"):
             dados_arvore["numero_processo"] = param
 
@@ -390,6 +403,149 @@ class SeiClient:
         Obtém a árvore completa de documentos de um processo.
         """
         return await self.consultar_processo(id_procedimento)
+
+    @staticmethod
+    def _normalizar_texto(texto: str) -> str:
+        """Remove acentos e caixa para comparação tolerante de nomes de tipo de documento."""
+        sem_acento = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+        return sem_acento.strip().lower()
+
+    def _resolver_id_serie(self, tipo: str, html_escolher_tipo: str) -> str:
+        """
+        Resolve o nome de um tipo de documento (ex: "Ordem de Serviço") para o id_serie numérico
+        exigido pelo SEI, a partir da lista de séries disponíveis na tela "Incluir Documento" da
+        unidade atual (atributo data-desc de cada linha da tabela). Aceita também o id_serie
+        numérico diretamente.
+        """
+        tipo_norm = tipo.strip()
+        if tipo_norm.isdigit():
+            return tipo_norm
+
+        tipo_lower = self._normalizar_texto(tipo_norm)
+        soup = BeautifulSoup(html_escolher_tipo, "html.parser")
+
+        candidatos = []
+        for row in soup.find_all("tr"):
+            desc = row.get("data-desc")
+            if not desc:
+                continue
+            link = row.find("a", onclick=re.compile(r"escolher\(\d+\)"))
+            if not link:
+                continue
+            m = re.search(r"escolher\((\d+)\)", link.get("onclick", ""))
+            if not m:
+                continue
+            desc_norm = self._normalizar_texto(desc)
+            if desc_norm == tipo_lower:
+                return m.group(1)
+            if tipo_lower in desc_norm:
+                candidatos.append(m.group(1))
+
+        if candidatos:
+            return candidatos[0]
+
+        raise SeiClientError(
+            f"Tipo de documento '{tipo}' não encontrado na lista de séries disponíveis para a unidade atual."
+        )
+
+    async def incluir_documento(
+        self,
+        id_procedimento: str,
+        tipo: str,
+        descricao: str = "",
+        id_documento_modelo: Optional[str] = None,
+        nivel_acesso: str = "0",
+    ) -> Dict[str, Any]:
+        """
+        Inclui um novo documento interno em um processo do SEI, opcionalmente copiando o
+        texto de um documento existente como conteúdo inicial (texto-base).
+
+        Não edita o corpo/conteúdo do documento além do texto-base copiado — a edição fina
+        do texto (CKEditor) ainda precisa ser feita manualmente no navegador.
+        """
+        resp_arv = await self._ir_para_arvore(id_procedimento)
+        html = resp_arv.text
+
+        m_tipo = re.search(r'(controlador\.php\?acao=documento_escolher_tipo[^"\']+)', html)
+        if not m_tipo:
+            raise SeiClientError(
+                f"Não foi possível localizar o link de 'Incluir Documento' no processo '{id_procedimento}' "
+                f"(verifique se a unidade atual tem permissão para incluir documentos nele)."
+            )
+        url_tipo = urljoin(str(resp_arv.url), m_tipo.group(1))
+        resp_tipo = await self.http_client.get(url_tipo, headers={"Referer": str(resp_arv.url)})
+
+        soup_tipo = BeautifulSoup(resp_tipo.text, "html.parser")
+        form1 = soup_tipo.find("form", id="frmDocumentoEscolherTipo")
+        if not form1:
+            raise SeiClientError("Formulário de escolha de tipo de documento não encontrado na resposta do SEI.")
+        action1 = urljoin(str(resp_tipo.url), form1.get("action"))
+        fields1 = {inp.get("name"): inp.get("value", "") for inp in form1.find_all("input") if inp.get("name")}
+
+        id_serie = self._resolver_id_serie(tipo, resp_tipo.text)
+        fields1["hdnIdSerie"] = id_serie
+
+        resp_gerar = await self.http_client.post(action1, data=fields1, headers={"Referer": str(resp_tipo.url)})
+
+        soup_gerar = BeautifulSoup(resp_gerar.text, "html.parser")
+        form2 = soup_gerar.find("form", id="frmDocumentoCadastro")
+        if not form2:
+            raise SeiClientError(
+                f"O SEI não retornou o formulário de cadastro para o tipo de documento '{tipo}' "
+                f"(id_serie={id_serie}) no processo '{id_procedimento}'."
+            )
+        action2 = urljoin(str(resp_gerar.url), form2.get("action"))
+
+        fields2: Dict[str, str] = {}
+        for inp in form2.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            if inp.get("type") == "radio":
+                if inp.get("checked") is not None:
+                    fields2[name] = inp.get("value", "")
+                continue
+            fields2[name] = inp.get("value", "")
+        for sel in form2.find_all("select"):
+            name = sel.get("name")
+            if not name:
+                continue
+            opt = sel.find("option", selected=True) or sel.find("option")
+            fields2[name] = opt.get("value", "") if opt else ""
+
+        fields2["txtDescricao"] = descricao
+        fields2["rdoNivelAcesso"] = nivel_acesso
+        fields2["rdoFormato"] = "N"
+        # O botão "Salvar" da tela de cadastro NÃO é um submit nativo: seu onclick roda
+        # confirmarDados(), que só então seta hdnFlagDocumentoCadastro='2' antes de enviar o
+        # formulário (submeter()). Sem replicar essa mudança de flag, o SEI apenas re-renderiza
+        # a mesma tela de cadastro (HTTP 200, sem mensagem de erro) e nenhum documento é criado.
+        fields2["hdnFlagDocumentoCadastro"] = "2"
+
+        if id_documento_modelo:
+            fields2["rdoTextoInicial"] = "D"
+            fields2["hdnIdDocumentoTextoBase"] = id_documento_modelo
+            fields2["txtProtocoloDocumentoTextoBase"] = id_documento_modelo
+        else:
+            fields2["rdoTextoInicial"] = "N"
+
+        resp_save = await self.http_client.post(action2, data=fields2, headers={"Referer": str(resp_gerar.url)})
+
+        m_novo_doc = re.search(r"[?&]id_documento=(\d+)", str(resp_save.url))
+        if not m_novo_doc or "acao=documento_gerar" in str(resp_save.url):
+            raise SeiClientError(
+                "O documento não foi criado — o SEI reapresentou o formulário de cadastro. "
+                "Verifique se o tipo de documento e os campos obrigatórios estão corretos."
+            )
+
+        return {
+            "sucesso": True,
+            "id_documento": m_novo_doc.group(1),
+            "id_procedimento": id_procedimento,
+            "id_serie": id_serie,
+            "id_documento_modelo": id_documento_modelo,
+            "url": str(resp_save.url),
+        }
 
     async def ler_documento(self, id_documento: str, id_procedimento: Optional[str] = None) -> Dict[str, Any]:
         """
