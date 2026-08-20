@@ -109,8 +109,11 @@ class SeiClient:
 
         logger.info(f"Iniciando login no SEI: {self.settings.base_url} com usuário: {self.settings.usuario} e órgão: {self.settings.orgao}")
 
-        # Passo 1: Acessar página de login para extrair formulário e mapear órgãos
-        login_url = self._build_url("controlador.php?acao=login")
+        # Passo 1: Acessar página de login para extrair formulário e mapear órgãos.
+        # SEI_LOGIN_URL permite apontar para uma página de login alternativa (ex: bridge
+        # de SSO institucional, como o MdGoiasLoginSEI.php do SEI-GO) quando o padrão
+        # controlador.php?acao=login não é o ponto de entrada real de autenticação.
+        login_url = self.settings.login_url or self._build_url("controlador.php?acao=login")
         try:
             resp_init = await self.http_client.get(login_url)
             resp_init.raise_for_status()
@@ -148,7 +151,12 @@ class SeiClient:
                         break
 
         # Passo 3: Preparar payload de login
-        post_url = self._build_url(login_form_data.get("action", "controlador.php?acao=login"))
+        # O action do form pode ser relativo ao DIRETORIO da pagina de login (nao ao
+        # SEI_BASE_URL) -- ex: pagina em /sei/modulos/x/login.php com action="login.php"
+        # deve resolver para /sei/modulos/x/login.php, nao /sei/login.php. urljoin contra
+        # a URL de fato buscada (resp_init.url) resolve isso corretamente em ambos os
+        # casos (action relativo ou absoluto).
+        post_url = urljoin(str(resp_init.url), login_form_data.get("action", "controlador.php?acao=login"))
         payload = {
             "txtUsuario": self.settings.usuario,
             "pwdSenha": self.settings.senha,
@@ -157,10 +165,14 @@ class SeiClient:
             "hdnOrgao": valor_orgao,
             "acao": "login",
         }
-        # Adiciona quaisquer campos ocultos identificados
+        # Adiciona quaisquer campos ocultos identificados na pagina estatica
         for k, v in login_form_data.get("fields", {}).items():
             if k not in payload and v:
                 payload[k] = v
+        # SEI_LOGIN_EXTRA_FIELDS tem prioridade maxima: cobre campos que o JS de submit
+        # da pagina altera em tempo de clique (ex: hdnAcao vira "2" no SEI-GO, mas o HTML
+        # estatico teria "1") -- o parser estatico nunca enxergaria essa mudanca.
+        payload.update(self.settings.get_login_extra_fields())
 
         # Passo 4: Enviar POST de autenticação
         try:

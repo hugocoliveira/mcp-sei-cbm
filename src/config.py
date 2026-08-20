@@ -3,9 +3,13 @@ Módulo de Configuração para o MCP SEI
 Carrega e valida as variáveis de ambiente e parâmetros de conexão.
 """
 
-from typing import Optional
+import json
+import logging
+from typing import Dict, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger("mcp_sei.config")
 
 
 class SeiSettings(BaseSettings):
@@ -43,6 +47,24 @@ class SeiSettings(BaseSettings):
         alias="SEI_UNIDADE",
         description="Unidade padrão ativa (sigla ou ID, ex: CBM/DTI)",
     )
+    login_url: Optional[str] = Field(
+        default=None,
+        alias="SEI_LOGIN_URL",
+        description=(
+            "URL completa alternativa para a página de login (ex: bridge de SSO "
+            "institucional, tipo MdGoiasLoginSEI.php). Sobrescreve o padrão "
+            "controlador.php?acao=login quando definida."
+        ),
+    )
+    login_extra_fields: Optional[str] = Field(
+        default=None,
+        alias="SEI_LOGIN_EXTRA_FIELDS",
+        description=(
+            'JSON com campos extras/override para o POST de login (ex: '
+            '\'{"hdnAcao":"2"}\'), para paginas de login cujo JS de submit '
+            "altera campos ocultos alem do que aparece no HTML estatico."
+        ),
+    )
     timeout: float = Field(
         default=30.0,
         alias="SEI_TIMEOUT",
@@ -78,6 +100,17 @@ class SeiSettings(BaseSettings):
         if len(self.senha) <= 3:
             return "***"
         return f"{self.senha[:2]}***{self.senha[-1]}"
+
+    def get_login_extra_fields(self) -> Dict[str, str]:
+        """Decodifica SEI_LOGIN_EXTRA_FIELDS (JSON) em dict; vazio se nao configurado/invalido."""
+        if not self.login_extra_fields:
+            return {}
+        try:
+            data = json.loads(self.login_extra_fields)
+            return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, AttributeError) as e:
+            logger.warning(f"SEI_LOGIN_EXTRA_FIELDS invalido (esperado JSON de objeto): {e}")
+            return {}
 
 
 def get_settings() -> SeiSettings:
